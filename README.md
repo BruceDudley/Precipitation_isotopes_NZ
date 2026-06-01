@@ -7,7 +7,7 @@ Here you will find:
 2. XGBoost (PINZ) H and O precipitation isoscapes as described in Dudley et al. 2026
 3. Metadata for precipitation isotope data, including contact details for data owners. 
 4. Instructions for requesting raw precipitation isotope data from data owners.
-5. Code for generating monthly precipitation isotope values from sub-monthly data in the database (isotope data processing.html). 
+5. Code for generating monthly precipitation isotope values from sub-monthly data in the database (isotope data processing.html), as part of an input file for the PINZ code. 
 
 
 
