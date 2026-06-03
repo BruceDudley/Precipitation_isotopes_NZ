@@ -1,0 +1,2760 @@
+---
+title: "National precipitation isotope data processing"
+author: "Bruce Dudley"
+date: "2025-07-08"
+format:
+  html:
+    self-contained: true       # make standalone HTML
+    code-fold: false
+    toc: true
+    toc-location: left
+    toc-title: Table of contents
+    number-sections: true
+editor: visual
+execute: 
+  cache: false                 # disable caching to avoid file permission issues
+  warning: false
+  message: false
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, 
+                      comment = "",
+                      warning = FALSE,
+                      message = FALSE,
+                      cache = TRUE,
+                      dev = 'png', dpi = 300, 
+                      fig.height = 5)
+
+library(tidyverse)  # includes purrr for functional programming
+library(robustbase)
+library(modelr)
+library(lubridate)
+library(skimr)       # summary of data
+library(dotwhisker)  # dot whisker plot for multiple regression results
+library(GGally)      # for scatterplots with correlation with ggpairs()
+library(leaflet)
+library(htmltools)   # for htmlEscape function
+library(ggmap)       # get_stamenmap() & ggmap
+library(cowplot)     # multiple plots for a figure
+library(broom)       # glance(), tidy() for linear regressions
+library(scales)
+library(ggrepel)     # geom_text_repel()
+library(purrr)
+# to do map interpolate of sinusoidal parameters
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+# devtools::install_github("ropensci/rnaturalearthhires")
+library(rnaturalearthhires)
+
+library(stars)
+library(gstat)
+
+library(janitor)  # for get_dupes() function
+library(writexl)
+
+
+library(flextable)
+set_flextable_defaults(big.mark = "")
+
+ft <- function(input.data, caption = "", num.rows = Inf) {
+  ft <- input.data %>%
+    slice_head(n = num.rows) %>%
+    flextable() %>%
+    autofit() %>%
+    theme_zebra() %>%
+    set_caption(caption)
+  ft
+}
+
+source("scripts/auxiliary.code.R")
+source("scripts/vcsn.functions.R")
+
+```
+
+# Read in output from previous runs of this code
+
+```{r}
+# Setup chunk — load processed climate data
+# output_dir <- "output"
+# rds_files <- list.files(output_dir, pattern = "^vcsn_data_.*\\.rds$", full.names = TRUE)
+
+# Load into a named list, named by site
+# climate_data_all_sites <- lapply(rds_files, readRDS)
+
+# Replace underscores with spaces in names to match isotope Site_Name format
+# site_names <- gsub("^vcsn_data_|\\.rds$", "", basename(rds_files))
+# site_names_spaces <- gsub("_", " ", site_names)
+
+# names(climate_data_all_sites) <- site_names_spaces
+
+
+```
+
+# Read in and check first raw dataset
+
+We'll start with the McDonnell dataset and do a few checks on our methods
+
+### Read in data
+
+```{r}
+
+library(readxl)
+
+# Read in the lookup table and sub-daily data
+lookup_table <- read_excel("JeffMcD.xlsx", sheet = "SITE DATA lookup")
+lookup_table<- lookup_table %>% dplyr::rename(lon = long)
+ddata <- read_excel("JeffMcD.xlsx", sheet = "DATA")
+dates<-read.csv('dates.csv')
+```
+
+### Add lats and longs from lookup to main dataframe
+
+```{r}
+library(dplyr)
+
+# Join long and lat from lookup_table into sub_daily_data
+ddata <- ddata %>%
+  left_join(
+    lookup_table %>% select(Site_Name, lon, lat),
+    by = "Site_Name"
+  )
+
+```
+
+### Amount weighting
+
+```{r}
+daily_data <- ddata %>%
+  mutate(Date = as.Date(Collection_Date_Time)) %>%
+  group_by(Institution, Project, Site_Name, SampleID, Date, Collector_type, lon, lat) %>%
+  summarise(
+    daily_precip = sum(Precipitation_mm, na.rm = TRUE),
+    d2H = {
+      valid <- Precipitation_mm > 0 & !is.na(d2H)
+      total_weight <- sum(Precipitation_mm[valid], na.rm = TRUE)
+      if (total_weight > 0) {
+        sum(d2H[valid] * Precipitation_mm[valid], na.rm = TRUE) / total_weight
+      } else {
+        NA_real_
+      }
+    },
+    d18O = NA_real_,  # Add empty column for compatibility
+    .groups = "drop"
+  ) %>%
+  rename(Precipitation_mm = daily_precip)
+
+
+
+```
+
+# Import VCSN data
+
+Now, for checking, we'll bring in the Virtual Climate Station Network (VCSN) data from the nearest grid point. We're most interested in daily rain data, because we'll need that to do rain weighting at sites without rainfall amount measurements.
+
+### Load the VCSN data folder
+
+```{r data VCSN locations}
+
+VCSN.directory <- "C:/Users/dudleybd/OneDrive - NIWA/Desktop/Precip isotope model/vcsn_data/"
+
+vcsn_info(VCSN.directory)
+vcsn.agent.locations <- vcsn_agent_locations(VCSN.directory)
+vcsn.agent.locations |> slice_head(n = 5)
+
+#plot(vcsn.agent.locations["Agent"], cex = 0.5, pch = 16)
+
+```
+
+The climate fields in the VCSN data are identified as
+
+<https://one.niwa.co.nz/display/CLIDB/VCSN+Times+and+Field+Descriptions>
+
+<https://one.niwa.co.nz/display/SYSTEMS/The+size+of+the+problem>
+
+(a) MSLP (Mean Sea Level Pressure)
+(b) PET (Potential Evapotranspiration)
+(c) Rain (daily rainfall)
+(d) RH (relative humidity)
+(e) SoilM (soil moisture)
+(f) ETmp (earth temperature at 10cm depth)
+(g) Rad (solar radiation)
+(h) TMax (maximum temperature)
+(i) Tmin (minimum temperature)
+(j) VP (vapour pressure)
+(k) Wind (average wind speed at 10m above ground level)
+(l) Rain_bc (Rainfall with bias correction)
+(m) Tmax_N (maximum temperature via different method)
+(n) Tmin_N (minimum temperature via different method)
+
+Potential evaporation or potential evapotranspiration is defined as the amount of evaporation that would occur if a sufficient water source were available.
+
+*Rain_bc*, *Tmax_n*, *Tmin_N* were introducted in 2019.
+
+### Append VCSN data to site (point, not catchment) information
+
+First add VCSN Agent numbers to the lookup table for Jeff's data
+
+```{r}
+
+
+lookup_table.plus.vcsn.agent <- lookup_table |>
+  vcsn_append_nearest_vcsn(VCSN.directory) 
+slice_head(lookup_table.plus.vcsn.agent, n = 1)
+```
+
+Clean up daily_data to match the full data file we'll import below.
+
+```{r}
+
+# Step 1: Rename `Date` to `Collection_Date`
+daily_data <- daily_data %>%
+  rename(Collection_Date = Date)
+
+# Step 2: Add `Start_Date` as previous collection date for each site
+daily_data <- daily_data %>%
+  arrange(Site_Name, Collection_Date) %>%
+  group_by(Site_Name) %>%
+  mutate(Start_Date = lag(Collection_Date)) %>%
+  ungroup()
+
+
+```
+
+### Data extraction for a single site
+
+```{r}
+
+# Step 1: Filter daily_data to this one site (for test)
+site_name <- lookup_table.plus.vcsn.agent$Site_Name[1]
+daily_data_site <- daily_data %>%
+  filter(Site_Name == site_name)
+
+# Step 2: Find earliest Start_Date and latest Collection_Date
+date_range <- daily_data_site %>%
+  summarise(
+    min_date = min(Start_Date, na.rm = TRUE),
+    max_date = max(Collection_Date, na.rm = TRUE)
+  )
+
+# Step 3: Get the years spanning this range (buffering to full years)
+years_needed <- seq(year(date_range$min_date), year(date_range$max_date))
+
+# Step 4: Pull out VCSN data for this site and date range
+# Loop over each site in the lookup table
+for (this_site in unique(lookup_table$Site_Name)) {
+
+  message("\n=== Starting site: ", this_site, " ===")
+
+  # Subset data
+  this_lookup <- lookup_table %>% filter(Site_Name == this_site)
+  this_daily <- daily_data %>% filter(Site_Name == this_site)
+
+  # Date range
+  date_range <- this_daily %>%
+    summarise(
+      min_date = min(Start_Date, na.rm = TRUE),
+      max_date = max(Collection_Date, na.rm = TRUE)
+    )
+
+  years_needed <- seq(year(date_range$min_date), year(date_range$max_date))
+
+  message("Years: ", paste(years_needed, collapse = ", "))
+
+  # Pull VCSN data
+  this_climate <- vcsn_append_climate_information(this_lookup, VCSN.directory, years_needed)
+
+  # Filter to actual range
+  this_climate <- this_climate %>%
+    filter(Date >= date_range$min_date, Date <= date_range$max_date)
+
+  # Save or store
+  saveRDS(this_climate, file = paste0("vcsn_data_", gsub(" ", "_", this_site), ".rds"))
+  message("✅ Done with site: ", this_site)
+}
+
+
+```
+
+### Function to assign isotope values to daily rainfall
+
+```{r}
+assign_isotopes_to_days <- function(site_df, iso_df, site_name) {
+  site_climate <- site_df %>% filter(Site_Name == site_name)
+  site_isotopes <- iso_df %>% filter(Site_Name == site_name)
+
+  assigned_values <- pmap(
+    list(site_isotopes$Start_Date, site_isotopes$Collection_Date, site_isotopes$d2H, site_isotopes$d18O),
+    function(start_date, end_date, d2h_val, d18o_val) {
+      if (is.na(start_date) | is.na(end_date) | start_date >= end_date) return(NULL)
+
+      tibble(
+        Date = seq.Date(start_date, end_date - 1, by = "day"),
+        Site_Name = site_name,
+        d2H = d2h_val,
+        d18O = d18o_val
+      )
+    }
+  )
+
+  assigned_df <- bind_rows(assigned_values)
+
+  left_join(site_climate, assigned_df, by = c("Date", "Site_Name"))
+}
+
+
+```
+
+### Run the function
+
+```{r}
+# Set site name (e.g., for your test site)
+test_site <- "MAIMAI (M8)"
+daily_with_isotopes <- assign_isotopes_to_days(this_climate, daily_data, test_site)
+
+# Check
+head(daily_with_isotopes %>% select(Date, Rain_bc, d2H, d18O))
+
+```
+
+### Clip to valid isotope period
+
+We keep only days that fall within the range of the isotope records:
+
+```{r}
+# Determine valid isotope date ranges for each site
+iso_date_ranges <- daily_data %>%
+  group_by(Site_Name) %>%
+  summarise(
+    min_date = min(Start_Date, na.rm = TRUE),
+    max_date = max(Collection_Date, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Clip to these ranges
+daily_with_isotopes_clipped <- daily_with_isotopes %>%
+  left_join(iso_date_ranges, by = "Site_Name") %>%
+  filter(Date >= min_date & Date <= max_date) %>%
+  select(-min_date, -max_date)
+
+```
+
+We group by site and month to calculate rainfall-weighted monthly isotope values:
+
+```{r}
+monthly_weighted <- daily_with_isotopes_clipped %>%
+  mutate(
+    year = year(Date),
+    month = month(Date),
+    year_month = floor_date(Date, "month")
+  ) %>%
+  group_by(Site_Name, year, month, year_month) %>%
+  summarise(
+    total_rainfall = sum(Rain_bc, na.rm = TRUE),
+weighted_d2H = ifelse(total_rainfall == 0, NA,
+                      sum(Rain_bc * d2H, na.rm = TRUE) / total_rainfall),
+weighted_d18O = ifelse(total_rainfall == 0, NA,
+                       sum(Rain_bc * d18O, na.rm = TRUE) / total_rainfall),
+    days_present = n_distinct(Date),
+    expected_days = days_in_month(first(Date)),
+    missing_days = expected_days - days_present,
+    incomplete_month = ifelse(missing_days > 0, "YES", "NO"),
+    .groups = "drop"
+  )
+
+```
+
+### Plotting back monthly weighted against measured daily data:
+
+```{r plotting back weighted}
+
+
+# Prepare monthly weighted d2H for plotting (representing *previous month*)
+monthly_weighted_d2H_plot <- monthly_weighted %>%
+  mutate(
+    Date = as.Date(paste(year, month, "01", sep = "-")) %m+% months(1)
+  ) %>%
+  dplyr::select(Site_Name, Date, d2H = weighted_d2H) %>%
+  mutate(Source = "Weighted monthly")
+
+# Prepare daily isotope sample data
+precip_iso_d2H_plot <- daily_data %>%
+  dplyr::select(Site_Name, Date = Collection_Date, d2H) %>%
+  mutate(Source = "Sample measurement")
+
+# Combine
+combined_plot_d2H <- bind_rows(monthly_weighted_d2H_plot, precip_iso_d2H_plot) %>%
+  filter(!is.na(Date) & !is.na(d2H))
+
+# Plot
+p<- ggplot(combined_plot_d2H, aes(x = Date, y = d2H, color = Source)) +
+  geom_point(size = 2) +
+  geom_line(
+    data = filter(combined_plot_d2H, Source == "Weighted monthly"),
+    aes(group = Site_Name),
+    size = 0.8
+  ) +
+  facet_wrap(~ Site_Name, scales = "free_x") +
+  scale_x_date(
+    date_breaks = "1 month",
+    date_labels = "%b %Y"
+  ) +
+  labs(
+    x = "Date",
+    y = expression(delta^{2}*H~"(\u2030)")
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+
+ggsave(
+  filename = "Maimai weighting effects.tif",
+  plot = p,
+  device = "tiff",
+  width = 10,    # in inches
+  height = 6,    # in inches
+  dpi = 300
+)
+p
+```
+
+### Revised plot
+
+```{r}
+
+
+# --- prepare monthly / daily (same as you) ---
+monthly_weighted_d2H_plot <- monthly_weighted %>%
+  mutate(Date = as.Date(paste(year, month, "01", sep = "-")) %m+% months(1)) %>%
+  select(Site_Name, Date, d2H = weighted_d2H, total_rainfall, incomplete_month) %>%
+  mutate(Source = "Weighted monthly")
+
+precip_iso_d2H_plot <- daily_data %>%
+  select(Site_Name, Date = Collection_Date, d2H, Precipitation_mm) %>%
+  mutate(Source = "Sample measurement")
+
+combined_plot_d2H <- bind_rows(monthly_weighted_d2H_plot, precip_iso_d2H_plot) %>%
+  filter(!is.na(Date) & !is.na(d2H))
+
+# --- scaling & axis tick locations ---
+min_d2H <- min(combined_plot_d2H$d2H, na.rm = TRUE)    # negative value
+max_rain <- max(daily_data$Precipitation_mm, na.rm = TRUE)
+
+rain_scale <- (abs(min_d2H) * 0.9) / max_rain
+
+# primary limits and breaks (left axis: negative values up to 0)
+primary_min <- floor(min_d2H / 10) * 10
+primary_max <- ceiling(max_rain * rain_scale / 10) * 10
+primary_breaks <- seq(primary_min, 0, by = 10)
+
+# secondary axis ticks (rain mm)
+sec_rain_breaks_mm <- pretty(c(0, max_rain), n = 5)          # e.g. 0,10,20...
+sec_primary_breaks <- sec_rain_breaks_mm * rain_scale        # positions in primary coords
+
+# --- x limits: use exact floor/ceiling dates to exclude Feb ---
+x_min <- floor_date(min(combined_plot_d2H$Date), "month")
+x_max <- ceiling_date(max(monthly_weighted_d2H_plot$Date), "month") - days(1)  # last day of Jan
+
+# --- vertical lines at start of each month within x-axis range ---
+vlines <- seq(x_min, x_max, by = "month")
+
+# prepare negative isotope horizontal gridline positions (in primary coords)
+iso_grid_ys <- primary_breaks  # e.g. -80, -70, ..., 0
+
+# --- Plot ---
+
+p <- ggplot() +
+  # rainfall bars
+  geom_col(
+    data = daily_data,
+    aes(x = Collection_Date, y = Precipitation_mm * rain_scale),
+    fill = "steelblue3",
+    color = "steelblue4",
+    width = 0.8
+  ) +
+  # isotope points
+  geom_point(
+    data = filter(combined_plot_d2H, Source == "Sample measurement"),
+    aes(x = Date, y = d2H, color = "Sample measurement"),
+    size = 2
+  ) +
+  geom_point(
+    data = filter(combined_plot_d2H, Source == "Weighted monthly"),
+    aes(x = Date, y = d2H, color = "Weighted monthly"),
+    size = 2
+  ) +
+  geom_line(
+    data = filter(combined_plot_d2H, Source == "Weighted monthly"),
+    aes(x = Date, y = d2H, color = "Weighted monthly", group = Site_Name),
+    linewidth = 0.8
+  ) +
+  # vertical dashed month lines
+  geom_vline(
+    xintercept = vlines,
+    linetype = "dashed",
+    color = "grey70"
+  ) +
+  # x-axis
+  scale_x_date(
+    date_breaks = "1 month",
+    date_labels = "%b %Y",
+    limits = c(x_min, x_max),
+    expand = c(0, 0)
+  ) +
+  facet_wrap(~ Site_Name, scales = "free_x") +
+  # isotope horizontal gridlines
+  annotate(
+    "segment",
+    x = x_min, xend = x_max,
+    y = iso_grid_ys,
+    yend = iso_grid_ys,
+    colour = "grey85",
+    size = 0.3
+  ) +
+  # y-axis scales
+  scale_y_continuous(
+    name = expression(delta^{2}*H~"(‰)"),
+    limits = c(primary_min, primary_max),
+    breaks = primary_breaks,
+    sec.axis = sec_axis(
+      trans = ~ . / rain_scale,
+      name = "Precipitation (mm)",
+      breaks = sec_primary_breaks,
+      labels = sec_rain_breaks_mm
+    )
+  ) +
+  scale_color_manual(
+    values = c("Sample measurement" = "grey40", "Weighted monthly" = "#D55E00"),
+    name = NULL
+  ) +
+  labs(x = "Date") +
+  theme_minimal(base_size = 12) +
+ theme(
+  legend.position = "bottom",
+  axis.text.x = element_text(angle = 0, hjust = 0.5),
+  panel.grid.major.y = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.text = element_text(size = 10),
+  
+  # Primary y-axis (left)
+  axis.title.y.left = element_text(
+    vjust = -0.5,                 # center vertically
+    margin = margin(r = 5)      # push left title away from axis
+  ),
+  
+  # Secondary y-axis (right)
+  axis.title.y.right = element_text(
+    vjust = 1.5,                 # center vertically
+    margin = margin(l = 7)      # push right title away from axis
+  ),
+  
+  plot.title = element_blank(),
+  plot.margin = margin(10, 30, 10, 20)
+)
+# save + show
+ggsave("Maimai_weighting_effects_vlines_rainbars_fixed_axes_v2.tif", plot = p,
+       device = "tiff", width = 10, height = 6, dpi = 300, compression = "lzw")
+
+p
+
+
+
+```
+
+## Another version of the plot, including 3-day and weekly rolling weighted values
+
+```{r}
+
+library(dplyr)
+library(slider)
+library(lubridate)
+library(tidyr)
+library(ggplot2)
+
+### ----------------------------------------------------------
+### 1. Prepare monthly weighted d2H
+### ----------------------------------------------------------
+monthly_weighted_d2H_plot <- monthly_weighted %>%
+  mutate(Date = as.Date(paste(year, month, "01", sep = "-")) %m+% months(1)) %>%
+  select(Site_Name, Date, d2H = weighted_d2H, total_rainfall, incomplete_month) %>%
+  mutate(Source = "Weighted monthly")
+
+### ----------------------------------------------------------
+### 2. Prepare sample-measured daily isotope values
+### ----------------------------------------------------------
+precip_iso_d2H_plot <- daily_data %>%
+  select(Site_Name, Date = Collection_Date, d2H, Precipitation_mm) %>%
+  mutate(Source = "Sample measurement")
+
+### ----------------------------------------------------------
+### 3. Compute 3-day and 7-day rolling weighted values
+### ----------------------------------------------------------
+rolling_weighted <- daily_with_isotopes_clipped %>%
+  arrange(Site_Name, Date) %>%
+  group_by(Site_Name) %>%
+  mutate(
+    rain_3d = slide_dbl(
+      Rain_bc,
+      ~ if (all(is.na(.x))) NA_real_ else sum(.x, na.rm = TRUE),
+      .before = 2,
+      .complete = TRUE
+    ),
+
+    wx_3d = slide_dbl(
+      Rain_bc * d2H,
+      ~ if (all(is.na(.x))) NA_real_ else sum(.x, na.rm = TRUE),
+      .before = 2,
+      .complete = TRUE
+    ),
+    d2H_3d = case_when(
+      is.na(rain_3d) ~ NA_real_,
+      rain_3d == 0 ~ NA_real_,
+      TRUE ~ wx_3d / rain_3d
+    ),
+    rain_7d = slide_dbl(
+      Rain_bc,
+      ~ if (all(is.na(.x))) NA_real_ else sum(.x, na.rm = TRUE),
+      .before = 6,
+      .complete = TRUE
+    ),
+    wx_7d = slide_dbl(
+      Rain_bc * d2H,
+      ~ if (all(is.na(.x))) NA_real_ else sum(.x, na.rm = TRUE),
+      .before = 6,
+      .complete = TRUE
+    ),
+    d2H_7d = case_when(
+      is.na(rain_7d) ~ NA_real_,
+      rain_7d == 0 ~ NA_real_,
+      TRUE ~ wx_7d / rain_7d
+    )
+  ) %>%
+  ungroup()
+
+### ----------------------------------------------------------
+### 4. Combine ALL isotope datasets — ONLY ONCE
+### ----------------------------------------------------------
+
+combined_plot_d2H <- bind_rows(
+  monthly_weighted_d2H_plot,
+  precip_iso_d2H_plot,
+  rolling_plot
+) %>%
+  filter(!is.na(Date) & !is.na(d2H)) %>%
+  mutate(
+    d2H = ifelse(d2H == 0, NA_real_, d2H)  # replace all exact zeros with NA
+  )
+
+
+### ----------------------------------------------------------
+### 5. Axis ranges and scaling
+### ----------------------------------------------------------
+min_d2H <- min(combined_plot_d2H$d2H, na.rm = TRUE)
+max_rain <- max(daily_data$Precipitation_mm, na.rm = TRUE)
+
+rain_scale <- (abs(min_d2H) * 0.9) / max_rain
+
+primary_min <- floor(min_d2H / 10) * 10
+primary_max <- ceiling(max_rain * rain_scale / 10) * 10
+primary_breaks <- seq(primary_min, 0, by = 10)
+
+sec_rain_breaks_mm <- pretty(c(0, max_rain), n = 5)
+sec_primary_breaks  <- sec_rain_breaks_mm * rain_scale
+
+x_min <- floor_date(min(combined_plot_d2H$Date), "month")
+x_max <- ceiling_date(max(monthly_weighted_d2H_plot$Date), "month") - days(1)
+
+vlines <- seq(x_min, x_max, by = "month")
+iso_grid_ys <- primary_breaks
+
+### ----------------------------------------------------------
+### 6. Plot
+### ----------------------------------------------------------
+p <- ggplot() +
+  geom_col(
+    data = daily_data,
+    aes(x = Collection_Date, y = Precipitation_mm * rain_scale),
+    fill = "steelblue3",
+    color = "steelblue4",
+    width = 0.8
+  ) +
+  geom_point(
+    data = filter(combined_plot_d2H, Source == "Sample measurement"),
+    aes(x = Date, y = d2H, color = "Sample measurement"),
+    size = 2
+  ) +
+  geom_point(
+    data = filter(combined_plot_d2H, Source == "Weighted monthly"),
+    aes(x = Date, y = d2H, color = "Weighted monthly"),
+    size = 2
+  ) +
+  geom_line(
+    data = filter(combined_plot_d2H, Source == "Weighted monthly"),
+    aes(x = Date, y = d2H, color = "Weighted monthly", group = Site_Name),
+    linewidth = 0.8
+  ) +
+  geom_line(
+    data = filter(combined_plot_d2H, Source == "Weighted 3-day"),
+    aes(x = Date, y = d2H, color = "Weighted 3-day", group = Site_Name),
+    linewidth = 0.6, alpha = 0.8
+  ) +
+  geom_line(
+    data = filter(combined_plot_d2H, Source == "Weighted 7-day"),
+    aes(x = Date, y = d2H, color = "Weighted 7-day", group = Site_Name),
+    linewidth = 0.6, alpha = 0.8
+  ) +
+  geom_vline(xintercept = vlines, linetype = "dashed", color = "grey70") +
+  scale_x_date(
+    date_breaks = "1 month",
+    date_labels = "%b %Y",
+    limits = c(x_min, x_max),
+    expand = c(0, 0)
+  ) +
+  facet_wrap(~ Site_Name, scales = "free_x") +
+  annotate("segment",
+           x = x_min, xend = x_max,
+           y = iso_grid_ys, yend = iso_grid_ys,
+           colour = "grey85", size = 0.3) +
+  scale_y_continuous(
+    name = expression(delta^{2}*H~"(‰)"),
+    limits = c(primary_min, primary_max),
+    breaks = primary_breaks,
+    sec.axis = sec_axis(
+      trans = ~ . / rain_scale,
+      name = "Precipitation (mm)",
+      breaks = sec_primary_breaks,
+      labels = sec_rain_breaks_mm
+    )
+  ) +
+  scale_color_manual(
+    values = c(
+      "Sample measurement" = "grey40",
+      "Weighted monthly"   = "#D55E00",
+      "Weighted 3-day"     = "#0072B2",
+      "Weighted 7-day"     = "#009E73"
+    ),
+    name = NULL
+  ) +
+  labs(x = "Date") +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 10),
+    axis.title.y.left = element_text(vjust = -0.5, margin = margin(r = 5)),
+    axis.title.y.right = element_text(vjust = 1.5, margin = margin(l = 7)),
+    plot.margin = margin(10, 30, 10, 20)
+  )
+
+ggsave("Maimai_weighting_effects_vlines_rainbars_fixed_axes_v2.tif",
+       plot = p, device = "tiff", width = 10, height = 6, dpi = 300, compression = "lzw")
+
+p
+
+```
+
+## Make a gif!
+
+Step 1: Install / load necessary packages
+
+```{r}
+library(gganimate)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+
+# --- 1. Prepare rainfall as a source ---
+rain_anim <- daily_data %>%
+  select(Site_Name, frame_date = Collection_Date, Precipitation_mm) %>%
+  mutate(Source = "Rain") %>%
+  mutate(d2H = NA_real_)  # add d2H column for compatibility
+
+# --- 2. Prepare sample measurements ---
+sample_anim <- combined_plot_d2H %>%
+  filter(Source == "Sample measurement") %>%
+  select(Site_Name, frame_date = Date, d2H, Source, Precipitation_mm)  # keep Precip_mm for later
+
+# --- 3. Prepare monthly & rolling weights ---
+weighted_anim <- combined_plot_d2H %>%
+  filter(Source != "Sample measurement" & Source != "Rain") %>%
+  select(Site_Name, frame_date = Date, d2H, Source) %>%
+  mutate(Precipitation_mm = NA_real_)
+
+# --- 4. Combine everything ---
+combined_anim <- bind_rows(rain_anim, sample_anim, weighted_anim) %>%
+  arrange(Site_Name, frame_date)
+
+# --- 5. Axis scaling ---
+min_d2H <- min(combined_anim$d2H, na.rm = TRUE)
+max_rain <- max(daily_data$Precipitation_mm, na.rm = TRUE)
+rain_scale <- (abs(min_d2H) * 0.9) / max_rain
+
+primary_min <- floor(min_d2H / 10) * 10
+primary_max <- ceiling(max_rain * rain_scale / 10) * 10
+primary_breaks <- seq(primary_min, 0, by = 10)
+
+sec_rain_breaks_mm <- pretty(c(0, max_rain), n = 5)
+sec_primary_breaks  <- sec_rain_breaks_mm * rain_scale
+
+x_min <- min(combined_anim$frame_date)
+x_max <- max(combined_anim$frame_date)
+vlines <- seq(x_min, x_max, by = "month")
+iso_grid_ys <- primary_breaks
+
+# --- 6. Animated plot ---
+p_anim <- ggplot(combined_anim) +
+  # Rainfall bars
+  geom_col(
+    data = filter(combined_anim, Source == "Rain"),
+    aes(x = frame_date, y = Precipitation_mm * rain_scale),
+    fill = "steelblue3",
+    color = "steelblue4",
+    width = 0.8
+  ) +
+  # Points for daily & monthly
+  geom_point(
+    data = filter(combined_anim, Source != "Rain"),
+    aes(x = frame_date, y = d2H, color = Source),
+    size = 2
+  ) +
+  # Lines for weighted
+  geom_line(
+    data = filter(combined_anim, Source %in% c("Weighted monthly", "Weighted 3-day", "Weighted 7-day")),
+    aes(x = frame_date, y = d2H, color = Source, group = Site_Name),
+    linewidth = 0.8
+  ) +
+  geom_vline(xintercept = vlines, linetype = "dashed", color = "grey70") +
+  scale_x_date(
+    date_breaks = "1 month",
+    date_labels = "%b %Y",
+    limits = c(x_min, x_max)
+  ) +
+  scale_y_continuous(
+    name = expression(delta^{2}*H~"(‰)"),
+    limits = c(primary_min, primary_max),
+    breaks = primary_breaks,
+    sec.axis = sec_axis(~ ./rain_scale, name = "Precipitation (mm)", breaks = sec_primary_breaks, labels = sec_rain_breaks_mm)
+  ) +
+  scale_color_manual(
+    values = c(
+      "Sample measurement" = "grey40",
+      "Weighted monthly"   = "#D55E00",
+      "Weighted 3-day"     = "#0072B2",
+      "Weighted 7-day"     = "#009E73"
+    ),
+    name = NULL
+  ) +
+  facet_wrap(~ Site_Name, scales = "free_x") +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 10),
+    axis.title.y.left = element_text(vjust = -0.5, margin = margin(r = 5)),
+    axis.title.y.right = element_text(vjust = 1.5, margin = margin(l = 7))
+  ) +
+  # animate over date
+  transition_reveal(frame_date) +
+  shadow_mark(past = TRUE, future = FALSE, alpha = 0.5)
+
+# --- 7. Save animation ---
+anim_save("Maimai_d2H_animation.gif", p_anim, width = 1000, height = 600, fps = 10)
+
+
+```
+
+# Import complete database
+
+```{r}
+ library(readxl)
+Lookup_full_database <- read.csv("Full_lookup.csv")
+# View(Lookup_full_database)
+ 
+ Full_database <- read.csv("Full_dailyplus.csv")
+# View(Full_database)
+ 
+```
+
+# Database and lookup table cleaning
+
+### Check which Site_Name values in Full_database don't match any in the lookup table
+
+```{r}
+# Get unmatched site names from Full_database
+bad_sites_in_data <- setdiff(
+  unique(Full_database$Site_Name),
+  unique(Lookup_full_database$Site_Name)
+)
+
+# View them
+bad_sites_in_data
+```
+
+Check for any instances of multiple rows with the same Site_Name and Collection_Date
+
+```{r}
+
+# Initial check, after which I went to the original dataframe and deleted 10 rows
+
+
+#duplicates <- Full_database %>%
+ # group_by(Site_Name, Collection_Date) %>%
+ # filter(n() > 1) %>%
+ # arrange(Site_Name, Collection_Date)
+
+#duplicates
+
+#duplicate_starts <- Full_database %>%
+ # group_by(Site_Name, Start_Date) %>%
+ # filter(n() > 1) %>%
+ #arrange(Site_Name, Start_Date)
+
+#duplicate_starts
+
+
+any(duplicated(Full_database[, c("Site_Name", "Collection_Date")]))
+any(duplicated(Full_database[, c("Site_Name", "Start_Date")]))
+```
+
+Check which Site_Name values in the lookup table don't appear in Full_database
+
+```{r}
+# Get unmatched site names from Lookup table
+unused_lookup_sites <- setdiff(
+  unique(Lookup_full_database$Site_Name),
+  unique(Full_database$Site_Name)
+)
+
+Lookup_full_database %>%
+  filter(Site_Name %in% unused_lookup_sites) %>%
+  select(Site_Name, Project) %>%
+  distinct()
+```
+
+The sites with no data are either duplicates (Christchurch and Kaitoke GNIP data are in the Taylor 1990 dataset), snow sites where we can't work out the date the snow fell, and one from Tim Kerr's postdoc that didn't have appropriate data. We can delete all these from the lookup table.
+
+### Clean out unneeded site lookup rows
+
+```{r}
+Lookup_filtered <- Lookup_full_database %>%
+  filter(!(Site_Name %in% unused_lookup_sites))
+```
+
+### Add in missing NZTM and NZMG to lookup table
+
+```{r}
+library(sf)
+lookup_sf <- st_as_sf(Lookup_filtered, coords = c("long", "lat"), crs = 4326)
+# Transform to NZTM
+lookup_nztm <- st_transform(lookup_sf, crs = 2193)
+
+# Extract NZTM coordinates
+coords_nztm <- st_coordinates(lookup_nztm)
+
+# Add to original dataframe
+Lookup_filtered$NZTME <- coords_nztm[,1]  # Easting
+Lookup_filtered$NZTMN <- coords_nztm[,2]  # Northing
+
+# Transform to NZMG (legacy)
+lookup_nzmg <- st_transform(lookup_sf, crs = 27200)
+
+# Extract and add NZMG coords
+coords_nzmg <- st_coordinates(lookup_nzmg)
+Lookup_filtered$NZMGE <- coords_nzmg[,1]
+Lookup_filtered$NZMGN <- coords_nzmg[,2]
+
+
+```
+
+### Make reasonable project names for mapping
+
+```{r}
+project_name_map <- c(
+  "CDRP" = "CDRP",
+  "None" = "TUD",
+  "GNIP/M/NZ/01" = "GNIP",
+  "Forest Flows" = "Forest Flows",
+  "Mt TeAroha " = "Mt Te Aroha",
+  "Waihi Estuary Focus Catchment Investigation" = "Waihi Estuary",
+  "Land Use Intensi?cation: Sustainable Management of Water Quantity and Quality Programme (NIWA)" = "LUWQ NIWA",
+  "Rotorua Lakes FaCTS" = "Rotorua FaCTS",
+  "NZWaM" = "NZWaM",
+  "Taylor 1990" = "DSIR",
+  "Tritium Input Function" = "GNS Tritium Input Function",
+  "Phase1_early M8 catchment-scale research and observations (1974\x961988)" = "Maimai M8",
+  "Hill AP transect" = "Hill AP transect",
+  "Tim Kerr postdoc" = "Kerr Postdoc",
+  "Hill AP transect / Jacks Thesis" = "Hill AP transect",
+  "Waterscape" = "Waterscape",
+  "Jack thesis + Zane thesis" = "UC Postgrad",
+  "AOSnow" = "Hill AOSnow",
+  "Jack thesis" = "UC Postgrad",
+  "Ashley Dene" = "Ashley Dene",
+  "Hill Haast transect" = "Hill Haast transect",
+  "Environment Southland" = "Environment Southland",
+  "B3" = "B3",
+  "Nehemy/Simmons tree water sources " = "Trent University"
+)
+
+# Apply the updated project name map
+Lookup_filtered$Project_clean <- dplyr::recode(Lookup_filtered$Project, !!!project_name_map)
+
+
+```
+
+## Site map showing sites split by project
+
+```{r}
+source('scripts/auxiliary.code_BD.R')
+ggmap::register_stadiamaps(key = "3ee03876-1ca3-4727-9391-cb8475022ba2")
+
+Lookup_filtered$Color <- Lookup_filtered$Project_clean
+
+# Add a numbered site label from north to south
+Lookup_filtered <- Lookup_filtered %>%
+  arrange(desc(lat)) %>%
+  mutate(Site_Label = row_number())
+
+site_map <- iso_plot_site_locations_BD(
+  the.data = Lookup_filtered,
+  site.column.name = "Site_Label",
+  lat.column.name = "lat",
+  lon.column.name = "long",
+  color.column.name = "Color",
+  island = "NZ"
+)
+
+print(site_map)
+
+ggsave("outputs/site_map.tif", site_map, width = 10, height = 8)
+```
+
+Looking good. Next step is to....
+
+# Load VCSN climate data for isotope data date ranges for all sites
+
+### Join long/lat to main dataset
+
+We’ll add lat and long columns to Full_database using the Site_Name as the join key:
+
+```{r}
+
+Full_database <- Full_database %>%
+  left_join(
+    Lookup_filtered %>% select(Site_Name, long, lat),
+    by = "Site_Name"
+  )
+  
+```
+
+### Add VCSN Agent (nearest climate grid point) to each site
+
+This attaches the nearest VCSN grid point to each site in the Lookup_filtered table:
+
+```{r}
+lookup_with_vcsn <- Lookup_filtered %>%
+  rename(lon = long) %>%
+  vcsn_append_nearest_vcsn(VCSN.directory)
+
+```
+
+### Check date formats on start and collection dates
+
+```{r}
+
+# Step 1: Check current column classes
+str(Full_database[, c("Start_Date", "Collection_Date")])
+
+```
+
+Convert date strings to Date format
+
+```{r}
+
+Full_database <- Full_database %>%
+  mutate(
+    Start_Date = as.Date(Start_Date, format = "%d/%m/%Y"),
+    Collection_Date = as.Date(Collection_Date, format = "%d/%m/%Y")
+  )
+
+```
+
+Check for NAs and remove the rows with them...
+
+```{r}
+Full_database %>%
+  filter(is.na(Start_Date) | is.na(Collection_Date)) %>%
+  select(Site_Name, SampleID, Start_Date, Collection_Date)
+
+Full_database <- Full_database %>%
+  filter(!is.na(Start_Date) & !is.na(Collection_Date))
+
+
+```
+
+Check for American interference in date formats!!
+
+This step checks for each site, whether the Start_Date or Collection_Date ever go backward in time, which would strongly suggest a date parsing issue.
+
+```{r}
+# Ensure dates are only converted from character to Date
+Full_database <- Full_database %>%
+  mutate(
+    Start_Date = if (is.character(Start_Date)) dmy(Start_Date) else Start_Date,
+    Collection_Date = if (is.character(Collection_Date)) dmy(Collection_Date) else Collection_Date
+  )
+
+# Find sites with non-sequential Collection_Date
+bad_collection <- Full_database %>%
+  group_by(Site_Name) %>%
+  arrange(Site_Name, Collection_Date) %>%
+  mutate(date_diff = Collection_Date - lag(Collection_Date)) %>%
+  filter(!is.na(date_diff) & date_diff < 0) %>%
+  ungroup()
+
+# Find sites with non-sequential Start_Date
+bad_start <- Full_database %>%
+  group_by(Site_Name) %>%
+  arrange(Site_Name, Start_Date) %>%
+  mutate(date_diff = Start_Date - lag(Start_Date)) %>%
+  filter(!is.na(date_diff) & date_diff < 0) %>%
+  ungroup()
+
+# Print a summary
+cat("🚨 Sites with Collection_Date going backward:\n")
+print(unique(bad_collection$Site_Name))
+
+cat("\n🚨 Sites with Start_Date going backward:\n")
+print(unique(bad_start$Site_Name))
+
+
+```
+
+## The actual VCSN climate data extraction
+
+### First test for a single site
+
+```{r}
+# Select the first unique site name
+#this_site <- unique(lookup_with_vcsn$Site_Name)[1]
+this_site <- 'Camp Stream'
+# Print the site name explicitly
+cat("\n=== Starting site:", this_site, "===\n")
+
+# Subset lookup and isotope data for this site
+this_lookup <- lookup_with_vcsn %>% filter(Site_Name == this_site)
+this_isotope <- Full_database %>% filter(Site_Name == this_site)
+
+# Sanity check
+cat("  → Isotope rows:", nrow(this_isotope), "\n")
+cat("  → Start_Date NA count:", sum(is.na(this_isotope$Start_Date)), "/", nrow(this_isotope), "\n")
+
+if (nrow(this_isotope) == 0 || all(is.na(this_isotope$Start_Date))) {
+  cat("⚠️  No data or missing Start_Date — skipping site.\n")
+} else {
+
+  # Determine date range of measurements
+  date_range <- this_isotope %>%
+    summarise(
+      min_date = min(Start_Date, na.rm = TRUE),
+      max_date = max(Collection_Date, na.rm = TRUE)
+    )
+
+  years_needed <- seq(year(date_range$min_date), year(date_range$max_date))
+  cat("  → Years needed:", paste(years_needed, collapse = ", "), "\n")
+
+  # Pull VCSN data
+  this_climate <- vcsn_append_climate_information(this_lookup, VCSN.directory, years_needed)
+
+  # Filter to the actual collection period
+  this_climate <- this_climate %>%
+    filter(Date >= date_range$min_date, Date <= date_range$max_date)
+
+  # Show head of result
+  cat("\n✅ Done with site:", this_site, "\n\n")
+  print(head(this_climate))
+}
+
+```
+
+### Full extraction
+
+```{r}
+
+# Create output directory if it doesn't exist
+output_dir <- "output"
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+# Loop over each site in the lookup table
+for (this_site in unique(lookup_with_vcsn$Site_Name)) {
+
+  # Generate expected filename
+  outfile <- file.path(output_dir, paste0("vcsn_data_", gsub("[^A-Za-z0-9_]", "", gsub(" ", "_", this_site)), ".rds"))
+
+  # Skip if file already exists
+  if (file.exists(outfile)) {
+    cat("\n⏭️ Skipping site (already processed):", this_site, "\n")
+    next
+  }
+
+  start_time <- Sys.time()
+  cat("\n=== Starting site:", this_site, "===\n")
+
+  # Subset lookup and isotope data for this site
+  this_lookup <- lookup_with_vcsn %>% filter(Site_Name == this_site)
+  this_isotope <- Full_database %>% filter(Site_Name == this_site)
+
+  cat("  → Isotope rows:", nrow(this_isotope), "\n")
+  cat("  → Start_Date NA count:", sum(is.na(this_isotope$Start_Date)), "/", nrow(this_isotope), "\n")
+
+  if (nrow(this_isotope) == 0 || all(is.na(this_isotope$Start_Date))) {
+    cat("⚠️  No data or missing Start_Date — skipping site.\n")
+    next
+  }
+
+  # Determine date range of measurements
+  date_range <- this_isotope %>%
+    summarise(
+      min_date = min(Start_Date, na.rm = TRUE),
+      max_date = max(Collection_Date, na.rm = TRUE)
+    )
+
+  years_needed <- seq(year(date_range$min_date), year(date_range$max_date))
+  cat("  → Years needed:", paste(years_needed, collapse = ", "), "\n")
+
+  # Pull VCSN data
+  this_climate <- vcsn_append_climate_information(this_lookup, VCSN.directory, years_needed)
+
+  # Filter to the actual collection period
+  this_climate <- this_climate %>%
+    filter(Date >= date_range$min_date, Date <= date_range$max_date)
+
+  # Save the data
+  saveRDS(this_climate, file = outfile)
+
+  duration <- round(difftime(Sys.time(), start_time, units = "secs"), 2)
+  cat("✅ Done with site:", this_site, "| Duration:", duration, "seconds\n")
+}
+
+```
+
+# Stack all the data together
+
+```{r}
+
+# Combine all dataframes in the list into one, adding site name as a column
+climate_data_all <- map2_dfr(
+  .x = climate_data_all_sites,
+  .y = names(climate_data_all_sites),
+  .f = ~ mutate(.x, Site_Label_From_ListName = .y)
+)
+# Tidy up
+
+climate_data_all <- climate_data_all %>%
+  select(-`VCSN.lat...24`, -`VCSN.lon...25`) %>%  # remove duplicate columns
+  rename(
+    VCSN.lat = `VCSN.lat...22`,
+    VCSN.lon = `VCSN.lon...23`
+  )
+
+head(climate_data_all)
+```
+
+# Revised function to assign isotope values to each rainfall day within a collection period
+
+```{r}
+# Make sure dates are Date class
+Full_database <- Full_database %>%
+  mutate(
+    Start_Date = as.Date(Start_Date),
+    Collection_Date = as.Date(Collection_Date)
+  )
+
+# Function stays the same — no changes needed
+assign_isotopes_to_days <- function(site_df, iso_df, site_name) {
+  site_climate <- site_df %>% filter(Site_Name == site_name)
+  site_isotopes <- iso_df %>% filter(Site_Name == site_name)
+
+  assigned_values <- pmap(
+    list(site_isotopes$Start_Date, site_isotopes$Collection_Date, site_isotopes$d2H, site_isotopes$d18O),
+    function(start_date, end_date, d2h_val, d18o_val) {
+      if (is.na(start_date) | is.na(end_date) | start_date >= end_date) return(NULL)
+
+      tibble(
+        Date = seq.Date(start_date, end_date - 1, by = "day"),
+        Site_Name = site_name,
+        d2H = d2h_val,
+        d18O = d18o_val
+      )
+    }
+  )
+
+  assigned_df <- bind_rows(assigned_values)
+
+  left_join(site_climate, assigned_df, by = c("Date", "Site_Name"))
+}
+
+# Apply to the first site
+first_site <- "Camp Stream"
+
+assigned_data <- assign_isotopes_to_days(climate_data_all, Full_database, first_site)
+
+```
+
+Clean out one problematic site
+
+```{r}
+# Remove the site from both datasets
+Full_database <- Full_database %>% filter(Site_Name != "Pokopoko at Allport Rd")
+climate_data_all <- climate_data_all %>% filter(Site_Name != "Pokopoko at Allport Rd")
+
+```
+
+# Full loop to assign isotope values to daily precipitation amounts
+
+```{r}
+# Make sure date columns are Date class
+Full_database <- Full_database %>%
+  mutate(
+    Start_Date = as.Date(Start_Date),
+    Collection_Date = as.Date(Collection_Date)
+  )
+
+assign_isotopes_to_days <- function(site_df, iso_df, site_name) {
+  site_climate <- site_df %>% filter(Site_Name == site_name)
+  site_isotopes <- iso_df %>% filter(Site_Name == site_name)
+
+  assigned_values <- pmap(
+    list(site_isotopes$Start_Date, site_isotopes$Collection_Date, site_isotopes$d2H, site_isotopes$d18O),
+    function(start_date, end_date, d2h_val, d18o_val) {
+      if (is.na(start_date) | is.na(end_date)) return(NULL)
+
+      date_seq <- if (start_date < end_date) {
+        seq.Date(start_date, end_date - 1, by = "day")  # normal case
+      } else if (start_date == end_date) {
+        start_date  # single-day case
+      } else {
+        return(NULL)  # invalid range
+      }
+
+      tibble(
+        Date = date_seq,
+        Site_Name = site_name,
+        d2H = d2h_val,
+        d18O = d18o_val
+      )
+    }
+  )
+
+  assigned_df <- bind_rows(assigned_values)
+
+  if (nrow(assigned_df) == 0) {
+    message("⚠️ No valid date range for site: ", site_name)
+    return(site_climate %>% mutate(d2H = NA_real_, d18O = NA_real_))
+  } else {
+    return(left_join(site_climate, assigned_df, by = c("Date", "Site_Name")))
+  }
+}
+
+
+# Loop over all unique sites and bind results
+all_sites <- unique(Full_database$Site_Name)
+
+assigned_all_sites <- map_dfr(all_sites, function(site) {
+  cat("Processing site:", site, "\n")
+  assign_isotopes_to_days(climate_data_all, Full_database, site)
+})
+
+```
+
+# Generate monthly rainfall weighted values
+
+```{r}
+monthly_weighted <- assigned_all_sites %>%
+  mutate(
+    Rain_bc = as.numeric(Rain_bc),
+    d2H = as.numeric(d2H),
+    d18O = as.numeric(d18O),
+    year = year(Date),
+    month = month(Date),
+    year_month = floor_date(Date, "month")
+  ) %>%
+  # Keep all data for plotting completeness
+  group_by(Site_Name, year, month, year_month) %>%
+  summarise(
+    total_rainfall = sum(Rain_bc, na.rm = TRUE),
+    weighted_d2H = if (all(is.na(d2H)) || sum(Rain_bc, na.rm = TRUE) == 0) NA else
+      sum(Rain_bc * d2H, na.rm = TRUE) / sum(Rain_bc, na.rm = TRUE),
+    weighted_d18O = if (all(is.na(d18O)) || sum(Rain_bc, na.rm = TRUE) == 0) NA else
+      sum(Rain_bc * d18O, na.rm = TRUE) / sum(Rain_bc, na.rm = TRUE),
+    
+    days_present = n_distinct(Date),
+    expected_days = days_in_month(first(Date)),
+    missing_days = expected_days - days_present,
+    incomplete_month = ifelse(missing_days > 0, "YES", "NO"),
+    sparse_month = days_present < 20,
+    .groups = "drop"
+  )
+
+
+```
+
+# Plotting back against measured values
+
+```{r}
+
+# 0. Remove sparse monthly values
+monthly_weighted_filtered <- monthly_weighted %>%
+  filter(!sparse_month) %>%
+  group_by(Site_Name) %>%
+  filter(n() > 0) %>%  # Only keep sites with valid data
+  ungroup()
+
+# ==== d2H ====
+
+# 1. Monthly weighted d2H for plotting: set date to 1st of next month
+monthly_weighted_d2H_plot <- monthly_weighted_filtered %>%
+  mutate(Date = make_date(year, month, 1) %>% ceiling_date(unit = "month")) %>%
+  select(Site_Name, Date, d2H = weighted_d2H) %>%
+  mutate(Source = "Weighted monthly")
+
+# 2. Sample d2H measurements
+precip_iso_d2H_plot <- Full_database %>%
+  mutate(Collection_Date = as.Date(Collection_Date)) %>%
+  select(Site_Name, Date = Collection_Date, d2H) %>%
+  mutate(d2H = as.numeric(d2H), Source = "Sample measurement")
+
+# 3. Combine
+valid_sites_d2H <- unique(monthly_weighted_d2H_plot$Site_Name)
+combined_plot_d2H <- bind_rows(
+  monthly_weighted_d2H_plot,
+  precip_iso_d2H_plot %>% filter(Site_Name %in% valid_sites_d2H)
+) %>%
+  filter(!is.na(Date) & !is.na(d2H))
+
+# 4. Save d2H plots
+dir.create("plots", showWarnings = FALSE)
+pdf("plots/d2H_weighted_vs_measured_by_site.pdf", width = 10, height = 6)
+
+for (site in unique(combined_plot_d2H$Site_Name)) {
+  this_data <- combined_plot_d2H %>% filter(Site_Name == site)
+  
+  p <- ggplot(this_data, aes(x = Date, y = d2H, color = Source, shape = Source)) +
+    geom_point(size = 2, alpha = 0.8) +
+    geom_line(data = filter(this_data, Source == "Weighted monthly"), aes(group = 1), linewidth = 1) +
+    scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+    labs(
+      title = paste0("Measured vs Weighted δ²H - ", site),
+      x = "Date",
+      y = expression(delta^{2}*H~"(\u2030)"),
+      color = "Data Source",
+      shape = "Data Source"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      strip.text = element_text(size = 10)
+    )
+  
+  print(p)
+}
+dev.off()
+
+# ==== d18O ====
+
+# 5. Monthly weighted d18O
+monthly_weighted_d18O_plot <- monthly_weighted_filtered %>%
+  mutate(Date = make_date(year, month, 1) %>% ceiling_date(unit = "month")) %>%
+  select(Site_Name, Date, d18O = weighted_d18O) %>%
+  mutate(Source = "Weighted monthly")
+
+# 6. Sample d18O measurements
+precip_iso_d18O_plot <- Full_database %>%
+  mutate(Collection_Date = as.Date(Collection_Date)) %>%
+  select(Site_Name, Date = Collection_Date, d18O) %>%
+  mutate(d18O = as.numeric(d18O), Source = "Sample measurement")
+
+# 7. Combine
+valid_sites_d18O <- unique(monthly_weighted_d18O_plot$Site_Name)
+combined_plot_d18O <- bind_rows(
+  monthly_weighted_d18O_plot,
+  precip_iso_d18O_plot %>% filter(Site_Name %in% valid_sites_d18O)
+) %>%
+  filter(!is.na(Date) & !is.na(d18O))
+
+# 8. Save d18O plots
+pdf("plots/d18O_weighted_vs_measured_by_site.pdf", width = 10, height = 6)
+
+for (site in unique(combined_plot_d18O$Site_Name)) {
+  this_data <- combined_plot_d18O %>% filter(Site_Name == site)
+  
+  p <- ggplot(this_data, aes(x = Date, y = d18O, color = Source, shape = Source)) +
+    geom_point(size = 2, alpha = 0.8) +
+    geom_line(data = filter(this_data, Source == "Weighted monthly"), aes(group = 1), linewidth = 1) +
+    scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+    labs(
+      title = paste0("Measured vs Weighted δ¹⁸O - ", site),
+      x = "Date",
+      y = expression(delta^{18}*O~"(\u2030)"),
+      color = "Data Source",
+      shape = "Data Source"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      strip.text = element_text(size = 10)
+    )
+  
+  print(p)
+}
+dev.off()
+
+
+```
+
+# Database add ins
+
+Now we create the two new logical columns in monthly_weighted_filtered dataframe — composite and exact_month — we can use Full_database to check for: 1. composite == TRUE if a month’s data is the result of multiple samples (i.e. multiple rows in Full_database) covering that month at a site. 2. exact_month == TRUE if the data covers the full calendar month exactly:
+
+```         
+The earliest Start_Date in that month is the first day of the month, and
+
+The latest Collection_Date is the last day of the month or the first day of the following month.
+```
+
+```{r}
+# 1. Prepare Full_database with month info
+full_with_months <- Full_database %>%
+  mutate(
+    Start_Date = as.Date(Start_Date),
+    Collection_Date = as.Date(Collection_Date),
+    year = year(Start_Date),
+    month = month(Start_Date)
+  )
+
+# 2. Summarise to get composite and exact_month flags
+monthly_flags <- full_with_months %>%
+  group_by(Site_Name, year, month) %>%
+  summarise(
+    n_samples = n(),
+    min_start = min(Start_Date, na.rm = TRUE),
+    max_end = max(Collection_Date, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    composite = n_samples > 1,
+    month_start = as.Date(sprintf("%d-%02d-01", year, month)),
+    month_end = ceiling_date(month_start, "month") - days(1),
+    next_month_start = ceiling_date(month_start, "month"),
+    
+    exact_month = min_start == month_start & 
+      (max_end == month_end | max_end == next_month_start)
+  ) %>%
+  select(Site_Name, year, month, composite, exact_month)
+
+# 3. Join flags back to your monthly_weighted_filtered dataframe
+monthly_weighted_flagged <- monthly_weighted_filtered %>%
+  left_join(monthly_flags, by = c("Site_Name", "year", "month")) %>%
+  mutate(
+    composite = case_when(
+      is.na(composite) ~ FALSE,                           # default
+      TRUE ~ composite                                     # use original composite flag if available
+    ),
+    exact_month = ifelse(is.na(exact_month), FALSE, exact_month),
+    
+    # second-tier: classify as composite if not exact_month but still complete
+    composite = ifelse(!exact_month & incomplete_month == "NO", TRUE, composite)
+  )
+
+head(monthly_weighted_flagged)
+```
+
+Check this is working:
+
+```{r}
+#monthly_weighted_flagged %>%
+#  filter(Site_Name %in% c("MAIMAI (M8)", "Kaitoke Rain"))
+
+#monthly_weighted_flagged %>%
+ # filter(Site_Name == "MAIMAI (M8)")
+
+#assigned_all_sites %>%
+#  filter(Site_Name == "MAIMAI (M8)")
+
+
+
+```
+
+### Table of different data types in the final weighted dataset
+
+```{r}
+# Step 1: Join project information into the flagged monthly data
+monthly_with_project <- monthly_weighted_flagged %>%
+  left_join(Lookup_filtered %>% select(Site_Name, Project_clean), by = "Site_Name")
+
+# Step 2: Summarise by project
+summary_by_project <- monthly_with_project %>%
+  group_by(Project_clean) %>%
+  summarise(
+    n_sites = n_distinct(Site_Name),
+    complete_months = sum(incomplete_month == "NO", na.rm = TRUE),
+    non_sparse_months = sum(sparse_month == FALSE, na.rm = TRUE),
+    exact_months = sum(exact_month == TRUE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_sites))  # Optional: sort by number of sites
+summary_by_project
+```
+
+# Testing for the effects of rainfall weighting using gridded climate data
+
+1.  Calculate a 'true rainfall weighting' column for monthly_weighted_flagged
+
+First we need to clear the 'measured' values out from the CDRP sites - these are actually VCSN data.
+
+```{r}
+
+Full_database <- Full_database %>%
+  mutate(Precipitation_mm = as.numeric(Precipitation_mm)) %>%
+  mutate(Precipitation_mm = if_else(Project == "CDRP", NA_real_, Precipitation_mm))
+
+
+```
+
+Then create a dataframe with quasi-daily precipitation isotope data and precipitaion amount data
+
+```{r}
+selected_sites <- c("B3. Kaitaia", "B3.Christchurch", "Ashley Dene"
+                                     ,"MAIMAI (M8)", "Melrose Farm")
+
+site_rain_data <- Full_database %>%
+  filter(Site_Name %in% selected_sites)
+
+```
+
+Add in some precip. data for Ashley Dene, and two of the B3 sites
+
+```{r}
+deneprecip<-read.csv("precip/Ashley Dene precipitation.csv")
+kaitaiaprecip<-read.csv("precip/kaitaia.csv")
+niwachch<-read.csv("precip/niwachch.csv")
+
+
+# Ensure Date columns are in Date format
+site_rain_data <- site_rain_data %>%
+  mutate(Start_Date = as.Date(Start_Date),
+         Collection_Date = as.Date(Collection_Date))
+
+deneprecip <- deneprecip %>%
+  mutate(Date = as.Date(Date, format = "%d/%m/%Y"))
+
+kataiaprecip <- kaitaiaprecip %>%
+  mutate(Date = as.Date(Date, format = "%d/%m/%Y"))
+
+niwachch <- niwachch %>%
+  mutate(Date = as.Date(Date, format = "%d/%m/%Y"))
+
+# --- Ashley Dene
+ashley_dene_samples <- site_rain_data %>%
+  filter(Project == "Ashley Dene") %>%
+  rowwise() %>%
+  mutate(precip_sum = sum(
+    deneprecip$Precipitation_mm[
+      deneprecip$Date >= Start_Date & deneprecip$Date < Collection_Date
+    ],
+    na.rm = TRUE
+  )) %>%
+  ungroup()
+
+# --- B3. Kaitaia
+kaitaia_samples <- site_rain_data %>%
+  filter(Site_Name == "B3. Kaitaia") %>%
+  rowwise() %>%
+  mutate(precip_sum = sum(
+    kataiaprecip$Rainfall.mm[
+      kataiaprecip$Date >= Start_Date & kataiaprecip$Date < Collection_Date
+    ],
+    na.rm = TRUE
+  )) %>%
+  ungroup()
+
+# --- B3.Christchurch
+chch_samples <- site_rain_data %>%
+  filter(Site_Name == "B3.Christchurch") %>%
+  rowwise() %>%
+  mutate(precip_sum = sum(
+    niwachch$Rain.mm[
+      niwachch$Date >= Start_Date & niwachch$Date < Collection_Date
+    ],
+    na.rm = TRUE
+  )) %>%
+  ungroup()
+
+# Combine and update Precipitation_mm
+updated_precip <- bind_rows(
+  ashley_dene_samples %>% select(Site_Name, SampleID, precip_sum),
+  kaitaia_samples %>% select(Site_Name, SampleID, precip_sum),
+  chch_samples %>% select(Site_Name, SampleID, precip_sum)
+)
+
+site_rain_data <- site_rain_data %>%
+  mutate(Precipitation_mm = as.numeric(Precipitation_mm)) %>%
+  left_join(updated_precip, by = c("Site_Name", "SampleID")) %>%
+  mutate(Precipitation_mm = if_else(!is.na(precip_sum), precip_sum, Precipitation_mm)) %>%
+  select(-precip_sum)
+
+
+```
+
+Check for rows with missing precipitation data, and count total rows and which sites are covered
+
+```{r}
+# Count total missing values
+site_rain_data %>%
+  filter(is.na(as.numeric(Precipitation_mm))) %>%
+  summarise(n_missing = n())
+
+# Count missing values by site
+site_rain_data %>%
+  filter(is.na(as.numeric(Precipitation_mm))) %>%
+  count(Site_Name, sort = TRUE)
+
+nrow(site_rain_data)
+unique(site_rain_data$Site_Name)
+
+```
+
+Now expand to a daily dataFrame
+
+We'll:
+
+```         
+Convert each sample into a sequence of dates based on the collection period
+
+Distribute rainfall equally across days in the period (excluding the final collection day)
+
+Assign the same isotope value (d18O, d2H) to each day in the period
+
+Then we'll combine all samples into one daily-level dataframe
+```
+
+```{r}
+
+
+# Ensure dates are properly formatted (you already have this from glimpse)
+daily_expanded <- site_rain_data %>%
+  # Calculate the number of days in each sampling period (excluding collection day)
+  mutate(
+    Start_Date = as.Date(Start_Date),
+    Collection_Date = as.Date(Collection_Date),
+    days = as.numeric(Collection_Date - Start_Date)
+  ) %>%
+  # Filter out any zero-day or malformed samples
+  filter(days > 0 & !is.na(Precipitation_mm)) %>%
+  # Expand each row into daily records
+  rowwise() %>%
+  mutate(
+    date_seq = list(seq.Date(Start_Date, Collection_Date - 1, by = "day")),
+    rain_per_day = Precipitation_mm / days
+  ) %>%
+  ungroup() %>%
+  unnest(cols = c(date_seq)) %>%
+  mutate(
+    Precipitation_mm = rain_per_day,
+    d18O = as.numeric(d18O),
+    d2H = as.numeric(d2H)
+  ) %>%
+  select(Site_Name, Project, date = date_seq, Precipitation_mm, d18O, d2H)
+
+```
+
+Rainfall-Weighted Monthly Means (calendar months)
+
+Now we'll:
+
+```         
+Extract year/month
+
+Group by site and calendar month
+
+Calculate rainfall-weighted means for d18O and d2H
+```
+
+```{r}
+rainfall_weighted_monthly <- daily_expanded %>%
+  mutate(year_month = floor_date(date, unit = "month")) %>%
+  group_by(Site_Name, Project, year_month) %>%
+  summarise(
+    total_rain = sum(Precipitation_mm, na.rm = TRUE),
+    
+    weighted_d18O = if (all(is.na(d18O) | Precipitation_mm == 0)) NA_real_ else
+      sum(d18O * Precipitation_mm, na.rm = TRUE) / sum(Precipitation_mm[!is.na(d18O)], na.rm = TRUE),
+    
+    weighted_d2H = if (all(is.na(d2H) | Precipitation_mm == 0)) NA_real_ else
+      sum(d2H * Precipitation_mm, na.rm = TRUE) / sum(Precipitation_mm[!is.na(d2H)], na.rm = TRUE),
+    
+    .groups = "drop"
+  ) %>%
+  # If total rainfall is zero, set isotope values to NA
+  mutate(
+    weighted_d18O = ifelse(total_rain == 0, NA_real_, weighted_d18O),
+    weighted_d2H  = ifelse(total_rain == 0, NA_real_, weighted_d2H)
+  )
+
+
+```
+
+Now - Combine monthly_weighted_flagged with rainfall_weighted_monthly and then adjust year_month to refer to the previous month
+
+```{r}
+
+# Step 1: Rename VCSN-derived columns
+monthly_flagged_renamed <- monthly_weighted_flagged %>%
+  rename(
+    VCSN_total_rainfall = total_rainfall,
+    VCSN_weighted_d2H = weighted_d2H,
+    VCSN_weighted_d18O = weighted_d18O
+  )
+
+
+# Perform a full join to bring the adjusted rainfall and isotope values into the VCSN dataframe
+monthly_combined <- full_join(
+  monthly_flagged_renamed,
+  rainfall_weighted_monthly %>%
+    select(Site_Name, year_month, 
+           Adjusted_total_rain = total_rain, 
+           Adjusted_weighted_d18O = weighted_d18O, 
+           Adjusted_weighted_d2H = weighted_d2H),
+  by = c("Site_Name", "year_month")
+)
+
+
+```
+
+Now cut the dataframe down for plotting
+
+```{r}
+filtered_df <- monthly_combined %>%
+  filter(!is.na(Adjusted_total_rain))
+
+```
+
+### Check to see why the plots below are missing a couple of sites in the html file...
+
+```{r}
+unique(filtered_df$Site_Name)
+```
+
+## Comparison plots and RMSE calculations
+
+```{r weighting plots through time, warning=FALSE}
+
+
+# Calculate RMSE values for each variable
+rmse_rain <- sqrt(mean((filtered_df$VCSN_total_rainfall - filtered_df$Adjusted_total_rain)^2, na.rm = TRUE))
+rmse_d18O <- sqrt(mean((filtered_df$VCSN_weighted_d18O - filtered_df$Adjusted_weighted_d18O)^2, na.rm = TRUE))
+rmse_d2H  <- sqrt(mean((filtered_df$VCSN_weighted_d2H - filtered_df$Adjusted_weighted_d2H)^2, na.rm = TRUE))
+
+# Plot for Rainfall
+rain_plot <- ggplot(filtered_df, aes(x = Adjusted_total_rain, y = VCSN_total_rainfall, color = Site_Name)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(title = paste0("Monthly Rainfall: RMSE = ", round(rmse_rain, 2), " mm"),
+       x = "Measured Rainfall (mm)",
+       y = "VCSN Rainfall (mm)") +
+  theme_minimal()
+
+# Plot for d18O
+d18O_plot <- ggplot(filtered_df, aes(x = Adjusted_weighted_d18O, y = VCSN_weighted_d18O, color = Site_Name)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(title = paste0("Monthly d18O: RMSE = ", round(rmse_d18O, 2), " ‰"),
+       x = "Measured d18O (‰)",
+       y = "VCSN d18O (‰)") +
+  theme_minimal()
+
+# Plot for d2H
+d2H_plot <- ggplot(filtered_df, aes(x = Adjusted_weighted_d2H, y = VCSN_weighted_d2H, color = Site_Name)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(title = paste0("Monthly d2H: RMSE = ", round(rmse_d2H, 2), " ‰"),
+       x = "Measured d2H (‰)",
+       y = "VCSN d2H (‰)") +
+  theme_minimal()
+
+# Print plots
+print(rain_plot)
+print(d18O_plot)
+print(d2H_plot)
+
+
+```
+
+### Line plots
+
+```{r}
+# --- Combine d2H and d18O into one long dataframe ---
+
+# Fix the date frameshift
+
+filtered_df <- filtered_df %>%
+  mutate(year_month = year_month %m+% months(1))
+
+# and plot
+
+df_combined <- filtered_df %>%
+  select(Site_Name, year_month,
+         VCSN_weighted_d2H, Adjusted_weighted_d2H,
+         VCSN_weighted_d18O, Adjusted_weighted_d18O) %>%
+  pivot_longer(
+    cols = c(VCSN_weighted_d2H, Adjusted_weighted_d2H,
+             VCSN_weighted_d18O, Adjusted_weighted_d18O),
+    names_to = c("Source", "isotope"),
+    names_pattern = "(VCSN|Adjusted)_weighted_(d2H|d18O)",
+    values_to = "value"
+  ) %>%
+  mutate(
+    isotope = recode(isotope,
+                     "d2H" = "δ²H",
+                     "d18O" = "δ¹⁸O"),
+    Source = recode(Source,
+                    "VCSN" = "VCSN weighted",
+                    "Adjusted" = "Adjusted weighted")
+  )
+
+# Reorder Site_Name so MAIMAI (M8) comes last
+df_combined <- df_combined %>%
+  mutate(Site_Name = factor(Site_Name,
+                            levels = c("Ashley Dene",
+                                       "B3. Kaitaia",
+                                       "B3.Christchurch",
+                                       "Melrose Farm",
+                                       "MAIMAI (M8)")))
+
+ggplot(df_combined, aes(x = year_month, y = value, color = Source)) +
+  geom_line(size = 1) +
+  geom_point(size = 1.5) +
+  facet_grid(
+    isotope ~ Site_Name,
+    scales = "free",
+    space = "fixed"
+  ) +
+  labs(
+    x = "Date",
+    # Multiline isotope label for both rows, spaced nicely
+    y = expression(paste("δ"^2*"H (‰)                    ", "\n\n\n", "δ"^18*"O (‰)")),
+    color = "Data Source"
+  ) +
+  scale_x_date(
+    date_labels = "%b-%y",
+    breaks = scales::breaks_pretty(n = 5),
+    expand = expansion(mult = c(0.01, 0.05))
+  ) +
+  scale_color_manual(
+    name = "Rainfall amount data source",
+    values = c(
+      "VCSN weighted" = "#0072B2",
+      "Adjusted weighted" = "#D55E00"
+    ),
+    labels = c(
+      "VCSN weighted" = "VCSN rainfall",
+      "Adjusted weighted" = "On-site rainfall"
+    )
+  ) +  # ✅ removed the stray parenthesis before this plus sign
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    strip.text = element_text(size = 10),
+    strip.text.y = element_blank(),  # remove isotope labels on side
+    legend.position = "bottom",
+    panel.spacing = unit(1.2, "lines"),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+# --- Save at publication quality (600 dpi) ---
+ggsave(
+  filename = "isotope_comparison_combined VCSN.tif",
+  plot = last_plot(),
+  width = 10,
+  height = 6,
+  dpi = 600,
+  units = "in",
+  compression = "lzw"
+)
+
+
+```
+
+# Test for effects of collection date 'frame shifts' away from a full month sampling date
+
+```{r }
+library(dplyr)
+library(lubridate)
+library(tidyr)
+
+# Step 1: Calendar-month weighted isotope values (true)
+monthly_true <- daily_expanded %>%
+  filter(!is.na(d2H) | !is.na(d18O)) %>%
+  mutate(
+    data_month = floor_date(date, "month"),
+    Collection_date = ceiling_date(date, "month")
+  ) %>%
+  group_by(Site_Name, data_month, Collection_date) %>%
+  summarise(
+    weighted_d2H = if (all(is.na(d2H))) NA else sum(Precipitation_mm * d2H, na.rm = TRUE) / sum(Precipitation_mm[!is.na(d2H)], na.rm = TRUE),
+    weighted_d18O = if (all(is.na(d18O))) NA else sum(Precipitation_mm * d18O, na.rm = TRUE) / sum(Precipitation_mm[!is.na(d18O)], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    year_month = Collection_date,
+    Start_date = data_month
+  ) %>%
+  select(Site_Name, year_month, weighted_d2H, weighted_d18O)
+
+# Step 2: Add one month before and after per site
+monthly_padded <- monthly_true %>%
+  group_by(Site_Name) %>%
+  summarise(
+    start = min(year_month) %m-% months(1),
+    end = max(year_month) %m+% months(1),
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    full_months = list(seq.Date(start, end, by = "1 month"))
+  ) %>%
+  unnest(cols = c(full_months)) %>%
+  rename(year_month = full_months) %>%
+  mutate(
+    Collection_date = year_month,
+    Start_date = year_month %m-% months(1)
+  ) %>%
+  select(Site_Name, year_month, Start_date, Collection_date) %>%
+  left_join(monthly_true, by = c("Site_Name", "year_month")) %>%
+  arrange(Site_Name, year_month)
+
+## Add in frame shift columns
+
+monthly_padded <- monthly_padded %>%
+  mutate(
+    Start_date5 = Start_date + days(5),
+    Collection_date5 = Collection_date + days(5),
+    Start_date10 = Start_date + days(10),
+    Collection_date10 = Collection_date + days(10),
+    Start_date15 = Start_date + days(15),
+    Collection_date15 = Collection_date + days(15)
+  )
+
+
+
+
+```
+
+### Join new date ranges back to daily dataset and calculate frame-shifted values
+
+```{r}
+library(dplyr)
+library(purrr)
+
+site_list <- unique(monthly_padded$Site_Name)
+
+# Function to compute shifted values for one site
+compute_shifts <- function(site_name) {
+  df_site <- monthly_padded %>% filter(Site_Name == site_name)
+
+  df_site <- df_site %>%
+    rowwise() %>%
+    mutate(
+      d2H_shift5 = {
+        df <- daily_expanded %>%
+          filter(
+            Site_Name == site_name,
+            date >= Start_date5,
+            date <= Collection_date5,
+            !is.na(d2H)
+          )
+        if (nrow(df) == 0) NA_real_ else sum(df$Precipitation_mm * df$d2H) / sum(df$Precipitation_mm)
+      },
+      d18O_shift5 = {
+        df <- daily_expanded %>%
+          filter(
+            Site_Name == site_name,
+            date >= Start_date5,
+            date <= Collection_date5,
+            !is.na(d18O)
+          )
+        if (nrow(df) == 0) NA_real_ else sum(df$Precipitation_mm * df$d18O) / sum(df$Precipitation_mm)
+      }
+    ) %>%
+    ungroup()
+
+  return(df_site)
+}
+
+# Apply the function to all sites
+monthly_padded <- map_dfr(site_list, compute_shifts)
+
+monthly_padded$d2H_shift10 <- NA_real_
+monthly_padded$d18O_shift10 <- NA_real_
+
+for (site in unique(monthly_padded$Site_Name)) {
+  site_rows <- monthly_padded$Site_Name == site
+  for (i in which(site_rows)) {
+    start <- monthly_padded$Start_date10[i]
+    end <- monthly_padded$Collection_date10[i]
+
+    df <- daily_expanded %>%
+      filter(Site_Name == site, date >= start, date <= end, !is.na(d2H))
+
+    if (nrow(df) > 0) {
+      monthly_padded$d2H_shift10[i] <- sum(df$Precipitation_mm * df$d2H) / sum(df$Precipitation_mm)
+    }
+
+    df <- daily_expanded %>%
+      filter(Site_Name == site, date >= start, date <= end, !is.na(d18O))
+
+    if (nrow(df) > 0) {
+      monthly_padded$d18O_shift10[i] <- sum(df$Precipitation_mm * df$d18O) / sum(df$Precipitation_mm)
+    }
+  }
+}
+
+monthly_padded$d2H_shift15 <- NA_real_
+monthly_padded$d18O_shift15 <- NA_real_
+
+for (site in unique(monthly_padded$Site_Name)) {
+  site_rows <- monthly_padded$Site_Name == site
+  for (i in which(site_rows)) {
+    start <- monthly_padded$Start_date15[i]
+    end <- monthly_padded$Collection_date15[i]
+
+    df <- daily_expanded %>%
+      filter(Site_Name == site, date >= start, date <= end, !is.na(d2H))
+
+    if (nrow(df) > 0) {
+      monthly_padded$d2H_shift15[i] <- sum(df$Precipitation_mm * df$d2H) / sum(df$Precipitation_mm)
+    }
+
+    df <- daily_expanded %>%
+      filter(Site_Name == site, date >= start, date <= end, !is.na(d18O))
+
+    if (nrow(df) > 0) {
+      monthly_padded$d18O_shift15[i] <- sum(df$Precipitation_mm * df$d18O) / sum(df$Precipitation_mm)
+    }
+  }
+}
+
+
+```
+
+### Now make a daily dataframe from the monthly weighted data
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+daily_weighted <- monthly_padded %>%
+  rowwise() %>%
+  mutate(date_seq = list(seq.Date(Start_date, Collection_date - 1, by = "day"))) %>%
+  unnest(date_seq) %>%
+  dplyr::select(Site_Name, Date = date_seq, weighted_d2H, weighted_d18O)
+
+# 5-day shifted
+daily_weighted_5 <- monthly_padded %>%
+  rowwise() %>%
+  mutate(date_seq = list(seq.Date(Start_date5, Collection_date5 - 1, by = "day"))) %>%
+  unnest(date_seq) %>%
+  dplyr::select(Site_Name, Date = date_seq, d2H = d2H_shift5, d18O = d18O_shift5)
+
+# 10-day shifted
+daily_weighted_10 <- monthly_padded %>%
+  rowwise() %>%
+  mutate(date_seq = list(seq.Date(Start_date10, Collection_date10 - 1, by = "day"))) %>%
+  unnest(date_seq) %>%
+  dplyr::select(Site_Name, Date = date_seq, d2H = d2H_shift10, d18O = d18O_shift10)
+
+# 15-day shifted
+daily_weighted_15 <- monthly_padded %>%
+  rowwise() %>%
+  mutate(date_seq = list(seq.Date(Start_date15, Collection_date15 - 1, by = "day"))) %>%
+  unnest(date_seq) %>%
+  dplyr::select(Site_Name, Date = date_seq, d2H = d2H_shift15, d18O = d18O_shift15)
+
+
+library(dplyr)
+
+# First, rename the isotope columns in the shifted datasets
+daily_weighted_5_renamed <- daily_weighted_5 %>%
+  rename(d2H_5 = d2H,
+         d18O_5 = d18O)
+
+daily_weighted_10_renamed <- daily_weighted_10 %>%
+  rename(d2H_10 = d2H,
+         d18O_10 = d18O)
+
+daily_weighted_15_renamed <- daily_weighted_15 %>%
+  rename(d2H_15 = d2H,
+         d18O_15 = d18O)
+
+# Start with daily_weighted, then left_join the others by Site_Name and Date
+combined_daily <- daily_weighted %>%
+  left_join(daily_weighted_5_renamed,  by = c("Site_Name", "Date")) %>%
+  left_join(daily_weighted_10_renamed, by = c("Site_Name", "Date")) %>%
+  left_join(daily_weighted_15_renamed, by = c("Site_Name", "Date"))
+
+# View result
+glimpse(combined_daily)
+
+
+
+```
+
+Now reattach this to the original daily dataframe
+
+```{r}
+library(dplyr)
+
+# Make sure the date columns are of the same name and type
+combined_daily_renamed <- combined_daily %>%
+  rename(date = Date)
+
+# Now join the new data to daily_expanded
+daily_expanded_joined <- daily_expanded %>%
+  left_join(combined_daily_renamed %>%
+              select(Site_Name, date, weighted_d2H, weighted_d18O, 
+                     d2H_5, d18O_5, d2H_10, d18O_10, d2H_15, d18O_15),
+            by = c("Site_Name", "date"))
+
+```
+
+### Put together a dataframe of 'frame shifted' dates
+
+```{r}
+
+monthly_final <- daily_expanded_joined %>%
+  # keep any row that has at least one isotope value
+  filter(
+    !is.na(d2H) | !is.na(d18O) |
+    !is.na(d2H_5) | !is.na(d18O_5) |
+    !is.na(d2H_10) | !is.na(d18O_10) |
+    !is.na(d2H_15) | !is.na(d18O_15)
+  ) %>%
+  mutate(
+    data_month     = floor_date(date,  "month"),
+    Collection_date = ceiling_date(date, "month")
+  ) %>%
+  group_by(Site_Name, data_month, Collection_date) %>%
+  summarise(
+    # — True daily isotopes
+    weighted_d2H        = if (all(is.na(d2H)))       NA_real_ else sum(Precipitation_mm * d2H,    na.rm = TRUE) / sum(Precipitation_mm[!is.na(d2H)],    na.rm = TRUE),
+    weighted_d18O       = if (all(is.na(d18O)))      NA_real_ else sum(Precipitation_mm * d18O,   na.rm = TRUE) / sum(Precipitation_mm[!is.na(d18O)],   na.rm = TRUE),
+    # — Check (using already-weighted daily values)
+    weighted_d2H_check  = if (all(is.na(weighted_d2H)))  NA_real_ else sum(Precipitation_mm * weighted_d2H,  na.rm = TRUE) / sum(Precipitation_mm[!is.na(weighted_d2H)],  na.rm = TRUE),
+    weighted_d18O_check = if (all(is.na(weighted_d18O))) NA_real_ else sum(Precipitation_mm * weighted_d18O, na.rm = TRUE) / sum(Precipitation_mm[!is.na(weighted_d18O)], na.rm = TRUE),
+
+    # — 5‑day shifted
+    weighted_d2H_5      = if (all(is.na(d2H_5)))     NA_real_ else sum(Precipitation_mm * d2H_5,   na.rm = TRUE) / sum(Precipitation_mm[!is.na(d2H_5)],   na.rm = TRUE),
+    weighted_d18O_5     = if (all(is.na(d18O_5)))    NA_real_ else sum(Precipitation_mm * d18O_5,  na.rm = TRUE) / sum(Precipitation_mm[!is.na(d18O_5)],  na.rm = TRUE),
+
+    # — 10‑day shifted
+    weighted_d2H_10     = if (all(is.na(d2H_10)))    NA_real_ else sum(Precipitation_mm * d2H_10,  na.rm = TRUE) / sum(Precipitation_mm[!is.na(d2H_10)],  na.rm = TRUE),
+    weighted_d18O_10    = if (all(is.na(d18O_10)))   NA_real_ else sum(Precipitation_mm * d18O_10, na.rm = TRUE) / sum(Precipitation_mm[!is.na(d18O_10)], na.rm = TRUE),
+
+    # — 15‑day shifted
+    weighted_d2H_15     = if (all(is.na(d2H_15)))    NA_real_ else sum(Precipitation_mm * d2H_15,  na.rm = TRUE) / sum(Precipitation_mm[!is.na(d2H_15)],  na.rm = TRUE),
+    weighted_d18O_15    = if (all(is.na(d18O_15)))   NA_real_ else sum(Precipitation_mm * d18O_15, na.rm = TRUE) / sum(Precipitation_mm[!is.na(d18O_15)], na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  # finally label your "month" and "start"
+  mutate(
+    year_month = Collection_date,
+    Start_date = data_month
+  ) %>%
+  select(
+    Site_Name, year_month, Start_date,
+    weighted_d2H,    weighted_d18O,
+    weighted_d2H_check,    weighted_d18O_check,
+    weighted_d2H_5,  weighted_d18O_5,
+    weighted_d2H_10, weighted_d18O_10,
+    weighted_d2H_15, weighted_d18O_15
+  )
+
+
+
+```
+
+### Plotting and RMSE calcs for date-shifting effects
+
+### Reshape monthly_final for plotting
+
+This reformats the wide structure into a tidy long format with labeled shift windows:
+
+```{r}
+
+comparison_long <- monthly_final %>%
+  select(Site_Name, year_month, starts_with("weighted_d")) %>%
+  pivot_longer(
+    cols = starts_with("weighted_d"),
+    names_to = "parameter",
+    values_to = "value"
+  ) %>%
+  mutate(
+    isotope = case_when(
+      grepl("d2H", parameter) ~ "δ²H",
+      grepl("d18O", parameter) ~ "δ¹⁸O"
+    ),
+    type = case_when(
+      parameter %in% c("weighted_d2H", "weighted_d18O") ~ "Calendar month",
+      parameter %in% c("weighted_d2H_5", "weighted_d18O_5") ~ "5-day shift",
+      parameter %in% c("weighted_d2H_10", "weighted_d18O_10") ~ "10-day shift",
+      parameter %in% c("weighted_d2H_15", "weighted_d18O_15") ~ "15-day shift",
+      grepl("check", parameter) ~ NA_character_,
+      TRUE ~ NA_character_
+    ),
+    type = factor(type, levels = c("Calendar month", "5-day shift", "10-day shift", "15-day shift"))
+  ) %>%
+  filter(!is.na(type)) %>%
+  mutate(Site_Name = factor(Site_Name, levels = c(setdiff(unique(Site_Name), "MAIMAI (M8)"), "MAIMAI (M8)"))) %>%
+  filter(!(Site_Name == "MAIMAI (M8)" & isotope == "δ¹⁸O"))
+
+```
+
+### Plot the isotope values by shift type
+
+```{r}
+
+# Keep isotope labels clean (no units here — we’ll add them manually in y-axis label)
+comparison_long <- comparison_long %>%
+  mutate(isotope = recode(isotope,
+                          "δ²H"  = "δ²H",
+                          "δ¹⁸O" = "δ¹⁸O"))
+
+ggplot(comparison_long, aes(x = year_month, y = value, color = type)) +
+  geom_line(size = 1) +
+  facet_grid(
+    isotope ~ Site_Name,
+    scales = "free",
+    space = "fixed"
+    # removed switch = "y" so isotope names disappear from the side
+  ) +
+  labs(
+    x = "Date",
+    # Custom multiline isotope label (adjust spacing as needed)
+    y = expression(paste("δ"^2*"H (‰)                    ", "\n\n\n", "δ"^18*"O (‰)")),
+    color = "Sampling period"
+  ) +
+  scale_x_date(
+    date_labels = "%b-%y",
+    breaks = scales::breaks_pretty(n = 5),
+    expand = expansion(mult = c(0.01, 0.05))
+  ) +
+  scale_color_manual(
+    values = c(
+      "Calendar month" = "#0072B2",
+      "5-day shift"    = "#D55E00",
+      "10-day shift"   = "#009E73",
+      "15-day shift"   = "#CC79A7"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    strip.text = element_text(size = 10),
+    strip.text.y = element_blank(),  # removes the facet row labels
+    legend.position = "bottom",
+    panel.spacing = unit(1.2, "lines"),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+# Save high-resolution version
+ggsave(
+  filename = "isotope_comparison.tif",
+  plot = last_plot(),
+  width = 10,
+  height = 6,
+  dpi = 600,
+  units = "in",
+  compression = "lzw"
+)
+
+```
+
+### Calculate RMSE values
+
+This compares each shifted series against the calendar-month baseline for both δ²H and δ¹⁸O
+
+```{r}
+library(Metrics)
+library(dplyr)
+library(tidyr)
+
+rmse_results <- comparison_long %>%
+  pivot_wider(
+    id_cols = c(Site_Name, year_month, isotope),
+    names_from = type,
+    values_from = value
+  ) %>%
+  group_by(Site_Name, isotope) %>%
+  summarise(
+    RMSE_5  = rmse(`Calendar month`, `5-day shift`),
+    RMSE_10 = rmse(`Calendar month`, `10-day shift`),
+    RMSE_15 = rmse(`Calendar month`, `15-day shift`),
+    .groups = "drop"
+  )
+
+# Add overall RMSE (pooled)
+overall_rmse <- comparison_long %>%
+  pivot_wider(
+    id_cols = c(Site_Name, year_month, isotope),
+    names_from = type,
+    values_from = value
+  ) %>%
+  group_by(isotope) %>%
+  summarise(
+    Site_Name = "Overall (pooled)",
+    RMSE_5  = rmse(`Calendar month`, `5-day shift`),
+    RMSE_10 = rmse(`Calendar month`, `10-day shift`),
+    RMSE_15 = rmse(`Calendar month`, `15-day shift`),
+    .groups = "drop"
+  )
+
+# Optional: overall mean of site-level RMSEs
+mean_rmse <- rmse_results %>%
+  group_by(isotope) %>%
+  summarise(
+    Site_Name = "Mean of site RMSEs",
+    RMSE_5  = mean(RMSE_5, na.rm = TRUE),
+    RMSE_10 = mean(RMSE_10, na.rm = TRUE),
+    RMSE_15 = mean(RMSE_15, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Combine
+rmse_results_combined <- bind_rows(rmse_results, mean_rmse, overall_rmse)
+
+print(rmse_results_combined)
+
+
+
+
+```
+
+# Combined RMSE table including rainfall weighting
+
+```{r}
+# ---- NEW: Calculate VCSN weighting RMSEs ----
+# ---- Helper: safe RMSE function that removes NAs ----
+safe_rmse <- function(x, y) {
+  df <- na.omit(data.frame(x, y))
+  if (nrow(df) == 0) return(NA_real_)
+  rmse(df$x, df$y)
+}
+
+# ---- NEW: Calculate VCSN weighting RMSEs ----
+vcsn_rmse <- df_combined %>%
+  pivot_wider(
+    id_cols = c(Site_Name, year_month, isotope),
+    names_from = Source,
+    values_from = value
+  ) %>%
+  group_by(Site_Name, isotope) %>%
+  summarise(
+    RMSE_VCSN = safe_rmse(`Adjusted weighted`, `VCSN weighted`),
+    .groups = "drop"
+  )
+
+vcsn_mean <- vcsn_rmse %>%
+  group_by(isotope) %>%
+  summarise(
+    Site_Name = "Mean of site RMSEs",
+    RMSE_VCSN = mean(RMSE_VCSN, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+vcsn_overall <- df_combined %>%
+  pivot_wider(
+    id_cols = c(Site_Name, year_month, isotope),
+    names_from = Source,
+    values_from = value
+  ) %>%
+  group_by(isotope) %>%
+  summarise(
+    Site_Name = "Overall (pooled)",
+    RMSE_VCSN = safe_rmse(`Adjusted weighted`, `VCSN weighted`),
+    .groups = "drop"
+  )
+
+vcsn_rmse_combined <- bind_rows(vcsn_rmse, vcsn_mean, vcsn_overall)
+
+
+# ---- Merge with main RMSE table ----
+rmse_results_final <- rmse_results_combined %>%
+  left_join(vcsn_rmse_combined, by = c("Site_Name", "isotope"))
+
+# ---- Round results for presentation ----
+rmse_results_final <- rmse_results_final %>%
+  mutate(across(starts_with("RMSE"), ~round(.x, 2)))
+
+print(rmse_results_final)
+```
+
+# Write final 'Stage 1' data outputs to an excel file
+
+```{r}
+library(writexl)
+
+# Function to clean illegal XML characters
+clean_illegal_chars <- function(df) {
+  df[] <- lapply(df, function(x) {
+    if (is.character(x)) {
+      # Force encoding to UTF-8 and replace invalid characters
+      x <- iconv(x, from = "", to = "UTF-8", sub = "")
+      # Remove characters not allowed in XML 1.0
+      x <- gsub("[^\x09\x0A\x0D\x20-\x7F]", "", x)
+    }
+    return(x)
+  })
+  return(df)
+}
+
+
+# Clean each dataframe
+Lookup_filtered_clean <- clean_illegal_chars(Lookup_filtered)
+Full_database_clean <- clean_illegal_chars(Full_database)
+monthly_weighted_clean <- clean_illegal_chars(monthly_weighted)
+summary_by_project_clean <- clean_illegal_chars(summary_by_project)
+
+# --- Prepare for export with consistent names ---
+
+# Fix column names in the monthly dataframe
+monthly_weighted_clean_fixed <- monthly_weighted_clean %>%
+  rename(
+    Site = Site_Name
+  ) %>%
+  mutate(day = 1) %>%  # add first of month as placeholder day
+  relocate(day, .after = month)
+
+# Fix the lookup dataframe name and columns to match "SITE DATA lookup"
+Lookup_filtered_clean_fixed <- Lookup_filtered_clean %>%
+  rename(
+    Site = Site_Name,
+    lat = lat,
+    long = long,
+    Elevation_masl = Elevation_masl
+  )
+
+# --- Write to Excel with names matching your import script ---
+write_xlsx(
+  list(
+    "SITE DATA lookup" = Lookup_filtered_clean_fixed,
+    "Monthly" = monthly_weighted_clean_fixed,
+    "Subdaily data" = ddata,
+    "Daily and greater" = Full_database_clean,
+    "Datatypes" = summary_by_project_clean
+  ),
+  path = "output/Processesed_database.xlsx"
+)
+
+
+
+
+
+
+```
+
+# Clean up metadata table for publishing
+
+```{r}
+# Load partially cleaned metadata table
+
+loaded.metadata<-read.csv("metadata_table.csv")
+
+# Elevation extraction using elevatr
+
+library(elevatr)
+library(sf)
+library(dplyr)
+
+
+# Convert to sf
+loaded.metadata.sf <- st_as_sf(
+  loaded.metadata,
+  coords = c("long", "lat"),
+  crs = 4326,
+  remove = FALSE
+)
+
+elevations <- get_elev_point(
+  locations = loaded.metadata.sf,
+  src = "aws",
+  z = 6             # coarse (~1 km) but will download safely
+)
+
+# Add elevation (meters)
+loaded.metadata$Elev_external <- elevations$elevation
+
+
+
+```
+
+## Add earliest dates and most recent dates onto lookup table
+
+```{r}
+library(dplyr)
+
+# ---- 1. Summarise isotope data by Site_Name ----
+
+site_summary <- Full_database %>%
+  group_by(Site_Name) %>%
+  summarise(
+    Date_first_collection = min(Collection_Date, na.rm = TRUE),
+    Date_last_collection  = max(Collection_Date, na.rm = TRUE),
+
+    # Count rows with data (non-NA)
+    n_d18O_precip_measurement = sum(!is.na(d18O)),
+    n_d2H_precip_measurement  = sum(!is.na(d2H)),
+    .groups = "drop"
+  )
+
+# ---- 2. Join to metadata ----
+
+loaded.metadata <- loaded.metadata %>%
+  left_join(site_summary, by = "Site_Name")
+
+```
+
+## Add in abbreviated project name for Figure 1
+
+```{r}
+metadata2<-read.csv("input/Metadata readin.csv")
+metadata2 <- metadata2 |>
+  mutate(Project = stringr::str_replace_all(Project, "\x96", "–"))
+
+project_name_map <- c(
+  "CDRP" = "CDRP",
+  "None" = "TUD",
+  "GNIP/M/NZ/01" = "GNIP",
+  "Forest Flows" = "Forest Flows",
+  "Mt TeAroha " = "Mt Te Aroha",
+  "Waihi Estuary Focus Catchment Investigation" = "Waihi Estuary",
+  "Land Use Intensification: Sustainable Management of Water Quantity and Quality Programme (NIWA)" = "LUWQ NIWA",
+  "Land Use Intensi?cation: Sustainable Management of Water Quantity and Quality Programme (NIWA)" = "LUWQ NIWA",  # old spelling
+  "Rotorua Lakes FaCTS" = "Rotorua FaCTS",
+  "NZWaM" = "NZWaM",
+  "Taylor 1990" = "DSIR",
+  "Tritium Input Function" = "GNS Tritium Input Function",
+  "Phase1_early M8 catchment-scale research and observations (1974–1988)" = "Maimai M8",
+  "Hill AP transect" = "Hill AP transect",
+  "Tim Kerr postdoc" = "Kerr Postdoc",
+  "Hill AP transect / Jacks Thesis" = "Hill AP transect",
+  "Waterscape" = "Waterscape",
+  "Jack thesis + Zane thesis" = "UC Postgrad",
+  "AOSnow" = "Hill AOSnow",
+  "Jack thesis" = "UC Postgrad",
+  "Ashley Dene" = "Ashley Dene",
+  "Hill Haast transect" = "Hill Haast transect",
+  "Environment Southland" = "Environment Southland",
+  "B3" = "B3",
+  "Nehemy/Simmons tree water sources " = "Trent University"
+)
+
+# Add the new column to metadata2
+metadata2 <- metadata2 |>
+  dplyr::mutate(
+    `Figure 1 project abbreviation` = dplyr::recode(Project, !!!project_name_map)
+  )
+
+
+```
+
+### Identify project names that don't match
+
+```{r}
+setdiff(metadata2$Project, names(project_name_map))
+
+head(metadata2$`Figure 1 project abbreviation`)
+
+metadata2 <- metadata2 |>
+  relocate('Figure 1 project abbreviation', .after = Project)
+
+write.csv(metadata2, "metadata2.csv", row.names = FALSE)
+```
+
+### Pull out metadata information for manuscript text
+
+```{r}
+# Identify snowpack sites
+metadata2 <- metadata2 %>%
+  mutate(is_snowpack = str_detect(tolower(Notes), "snowpack"))
+
+total_sites <- nrow(metadata2)
+snow_sites  <- sum(metadata2$is_snowpack, na.rm = TRUE)
+non_snow_sites <- total_sites - snow_sites
+
+total_sites
+snow_sites
+non_snow_sites
+
+```
+
+Earliest and latest collection dates
+
+```{r}
+library(lubridate)
+
+metadata2 <- metadata2 %>%
+  mutate(
+    Date_first_collection = dmy(Date_first_collection),
+    Date_last_collection  = dmy(Date_last_collection)
+  )
+
+earliest_first <- min(metadata2$Date_first_collection, na.rm = TRUE)
+latest_last    <- max(metadata2$Date_last_collection,  na.rm = TRUE)
+
+earliest_first
+latest_last
+
+```
+
+Max and average number of samples at non 'snowpack' sites
+
+```{r}
+# Maximum samples at any site
+max_samples <- max(metadata2$n_d18O_precip_measurement, na.rm = TRUE)
+
+# Average samples per *non-snowpack* site
+avg_samples_non_snow <- metadata2 %>%
+  filter(!is_snowpack) %>%
+  summarise(mean_samples = median(n_d18O_precip_measurement, na.rm = TRUE)) %>%
+  pull(mean_samples)
+
+max_samples
+avg_samples_non_snow
+
+```
+
+### Frequency breakdown
+
+```{r}
+
+freq_split_non_snow <- metadata2 %>%
+  filter(!is_snowpack) %>%        # keep only non-snowpack sites
+  count(Frequency, name = "n_sites")
+
+freq_split_non_snow
+
+```
