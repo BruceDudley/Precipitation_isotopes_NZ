@@ -6,7 +6,7 @@ Here you will find:
 2. Metadata for precipitation isotope data, including contact details for data owners. 
 3. Instructions for requesting raw precipitation isotope data from data owners.
 4. Code for generating monthly precipitation isotope values from sub-monthly data in the database (isotope data processing.html), as part of an input file for the PINZ code.
-5. Code for extracting PINZ predictions for your own sites ('PINZ extraction code' folder), but please note that the XGBoost (PINZ) H and O precipitation isoscape file is too big for GitHub so you'll need to download that from 10.5281/zenodo.20501203 
+5. Code for extracting PINZ predictions for your own sites ('PINZ extraction code.zip' folder), but please note that the XGBoost (PINZ) H and O precipitation isoscape file is too big for GitHub so you'll need to download that from 10.5281/zenodo.20501203 
 
 
 
